@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String
 from app.database import Base
 
+
 class Book(Base):
     __tablename__ = "books"
 
@@ -8,11 +9,3 @@ class Book(Base):
     title = Column(String, index=True)
     description = Column(String, nullable=True)
     author = Column(String)
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True)
-    hashed_password = Column(String)

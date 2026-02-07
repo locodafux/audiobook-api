@@ -1,10 +1,10 @@
 from sqlalchemy.orm import Session
-from . import models
-from . import schemas
+from app.models import Book
+from app.schemas import BookCreate
 
 
-def create_book(db: Session, book: schemas.BookCreate):
-    db_book = models.Book(**book.model_dump())
+def create_book(db: Session, book: BookCreate):
+    db_book = Book(**book.model_dump())
     db.add(db_book)
     db.commit()
     db.refresh(db_book)
@@ -12,11 +12,11 @@ def create_book(db: Session, book: schemas.BookCreate):
 
 
 def get_books(db: Session):
-    return db.query(models.Book).all()
+    return db.query(Book).all()
 
 
 def get_book(db: Session, book_id: int):
-    return db.query(models.Book).filter(models.Book.id == book_id).first()
+    return db.query(Book).filter(Book.id == book_id).first()
 
 
 def delete_book(db: Session, book_id: int):
@@ -25,4 +25,3 @@ def delete_book(db: Session, book_id: int):
         db.delete(book)
         db.commit()
     return book
-
