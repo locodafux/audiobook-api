@@ -19,6 +19,18 @@ def get_book(db: Session, book_id: int):
     return db.query(Book).filter(Book.id == book_id).first()
 
 
+def update_book(db: Session, book_id: int, book: BookCreate):
+    db_book = db.query(Book).filter(Book.id == book_id).first()
+    if not db_book:
+        return None
+    db_book.title = book.title
+    db_book.description = book.description
+    db_book.author = book.author
+    db.commit()
+    db.refresh(db_book)
+    return db_book
+
+
 def delete_book(db: Session, book_id: int):
     book = get_book(db, book_id)
     if book:
