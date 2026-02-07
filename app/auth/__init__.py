@@ -1,7 +1,7 @@
 from .auth import (
     create_access_token,
     get_current_user,
-    oauth2_scheme,
+    bearer_scheme,
     SECRET_KEY,
     ALGORITHM,
     ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -10,7 +10,7 @@ from .auth import (
 __all__ = [
     "create_access_token",
     "get_current_user",
-    "oauth2_scheme",
+    "bearer_scheme",
     "SECRET_KEY",
     "ALGORITHM",
     "ACCESS_TOKEN_EXPIRE_MINUTES",
