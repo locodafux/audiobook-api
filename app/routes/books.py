@@ -1,21 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from datetime import timedelta
 
 from app.schemas import BookCreate, Book as BookSchema
 from app.controllers import book_controller
-from app.database import SessionLocal
 from app.auth import get_current_user
+from app.database import get_db
 
 router = APIRouter(prefix="/books", tags=["books"])
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 @router.post("", response_model=BookSchema)

@@ -1,3 +1,4 @@
+from . import auth
 from .auth import (
     create_access_token,
     get_current_user,
@@ -8,6 +9,7 @@ from .auth import (
 )
 
 __all__ = [
+    "auth",
     "create_access_token",
     "get_current_user",
     "bearer_scheme",

@@ -5,17 +5,9 @@ from datetime import timedelta
 from app.schemas import UserCreate, UserLogin, Token
 from app.controllers import user_controller
 from app.auth import auth
-from app.database import SessionLocal
+from app.database import get_db
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 @router.post("/register", response_model=Token)
