@@ -1,5 +1,8 @@
 import os
 import warnings
+import torch
+import soundfile as sf
+import io
 from kokoro import KPipeline
 from huggingface_hub import snapshot_download
 
@@ -18,23 +21,31 @@ VOICES = {
 }
 
 def init_kokoro():
+    """Initialize Kokoro pipeline once."""
     global pipeline
-
     if pipeline is None:
         print("Downloading Kokoro model if needed...")
         snapshot_download(
             repo_id="hexgrad/Kokoro-82M",
             allow_patterns=["*.pth", "config.json", "voices/*.pt"]
         )
-
         pipeline = KPipeline(lang_code='a')
         print("Kokoro pipeline initialized.")
 
-def generate_audio(text: str, voice: str, speed: float = 1.0):
+def generate_audio_stream(text: str, voice: str = "af_heart", speed: float = 1.0):
+    """Generator that yields WAV bytes chunks for streaming."""
     if voice not in VOICES:
-        raise ValueError("Invalid voice")
+        raise ValueError(f"Invalid voice: {voice}")
 
     generator = pipeline(text, voice=voice, speed=speed)
 
     for _, _, audio in generator:
-        return audio
+        # Convert Tensor -> NumPy if needed
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+
+        # Convert NumPy -> WAV bytes
+        buf = io.BytesIO()
+        sf.write(buf, audio, samplerate=22050, format="WAV")
+        buf.seek(0)
+        yield buf.read()  # yield bytes chunk
