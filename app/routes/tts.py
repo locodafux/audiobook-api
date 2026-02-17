@@ -70,7 +70,10 @@ async def tts_test():
         <pre id="log" style="border:1px solid #ccc;padding:10px;height:150px;overflow:auto;"></pre>
 
         <script>
-            const ws = new WebSocket("ws://" + location.host + "/ws/tts");
+            // Dynamic WebSocket URL for HTTP/HTTPS (ws/wss)
+            const protocol = location.protocol === "https:" ? "wss" : "ws";
+            const ws = new WebSocket(protocol + "://" + location.host + "/ws/tts");
+
             const log = document.getElementById('log');
             const player = document.getElementById('player');
 
@@ -130,7 +133,7 @@ async def tts_test():
                     return;
                 }
 
-                // Split into sentences using simple regex
+                // Simple sentence splitter
                 const sentences = text.match(/[^.!?]+[.!?]?/g) || [text];
                 addLog("Sending " + sentences.length + " sentences for TTS...");
 
