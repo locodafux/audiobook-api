@@ -27,11 +27,12 @@ def startup_event():
 # ----------------------------
 # Include routers
 # ----------------------------
-from app.routes import books, users, tts
+from app.routes import books, users, tts, epub_tts
 
-app.include_router(books.router, prefix="/books", tags=["Books"])
-app.include_router(users.router, prefix="/users", tags=["Users"])
+app.include_router(books.router)
+app.include_router(users.router)
 app.include_router(tts.router, prefix="", tags=["TTS"])
+app.include_router(epub_tts.router, prefix="", tags=["EPUB_TTS"])
 
 # ----------------------------
 # Run uvicorn (local dev)

@@ -17,7 +17,7 @@ async def websocket_tts(websocket: WebSocket):
             data = await websocket.receive_json()
             text = data.get("text")
             voice = data.get("voice", "af_heart")
-            speed = data.get("speed", 1.0)
+            speed = data.get("speed", 2)
 
             if not text:
                 await websocket.send_json({"error": "Text is required"})
