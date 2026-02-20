@@ -6,6 +6,7 @@ import io
 import re
 import numpy as np
 from kokoro import KPipeline
+from pydub import AudioSegment
 from huggingface_hub import snapshot_download
 
 pipeline = None
@@ -20,7 +21,6 @@ def generate_full_chapter(text: str, voice: str = "af_heart", speed: float = 1.0
     start_perf = time.perf_counter()
     init_kokoro()
     
-    # Explicitly chunk by sentence using regex to ensure metadata matches exactly
     sentences = re.split(r'(?<=[.!?])\s+', text.replace('\n', ' ').strip())
     
     combined_audio = []
@@ -32,7 +32,6 @@ def generate_full_chapter(text: str, voice: str = "af_heart", speed: float = 1.0
     for i, sentence in enumerate(sentences):
         if not sentence.strip(): continue
         
-        # Process one sentence at a time
         generator = pipeline(sentence, voice=voice, speed=speed)
         
         for gs, ps, audio in generator:
@@ -52,8 +51,22 @@ def generate_full_chapter(text: str, voice: str = "af_heart", speed: float = 1.0
             current_time += (duration + 0.15)
 
     final_audio = np.concatenate(combined_audio)
+    
+    # --- ENHANCED COMPRESSION LOGIC ---
+    # 1. Convert numpy array to AudioSegment
+    # Note: Kokoro outputs float32, we scale to int16 for standard audio files
+    audio_int16 = (final_audio * 32767).astype(np.int16)
+    audio_segment = AudioSegment(
+        audio_int16.tobytes(), 
+        frame_rate=sample_rate,
+        sample_width=2, 
+        channels=1
+    )
+
     buf = io.BytesIO()
-    sf.write(buf, final_audio, samplerate=sample_rate, format="MP3")
+    # 2. Export with lower bitrate (48k is great for voice)
+    # This will significantly reduce size compared to the standard sf.write
+    audio_segment.export(buf, format="mp3", bitrate="48k") 
     buf.seek(0)
     
     return buf.read(), metadata, round(time.perf_counter() - start_perf, 2)
