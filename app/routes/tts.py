@@ -25,20 +25,27 @@ BOOK_PATH = os.path.join(APP_ROOT, "storage", "books", "mvs-1401-2100.epub")
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Updated Table: added 'epub_item_id' to link back to the EPUB file structure
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         book_slug TEXT,
         chapter_slug TEXT,
+        epub_item_id TEXT,    
         telegram_id TEXT,
         metadata_json TEXT,
-        UNIQUE(book_slug, chapter_slug)
+        UNIQUE(book_slug, epub_item_id)
     )
     ''')
-    try:
+    
+    # Migrations for existing DBs
+    columns = [row[1] for row in cursor.execute("PRAGMA table_info(chapters)")]
+    if "telegram_id" not in columns:
         cursor.execute("ALTER TABLE chapters ADD COLUMN telegram_id TEXT")
-    except sqlite3.OperationalError:
-        pass
+    if "epub_item_id" not in columns:
+        cursor.execute("ALTER TABLE chapters ADD COLUMN epub_item_id TEXT")
+        
     conn.commit()
     conn.close()
 
@@ -53,8 +60,20 @@ class ChapterRequest(BaseModel):
     speed: float = 1.0
     book_title: str = "mvs-1401-2100"
     chapter_name: str = "chapter"
+    epub_item_id: str = "" # Added to request
 
+    
 # --- API ENDPOINTS ---
+
+@router.get("/book/status")
+async def get_generation_status():
+    """Returns a list of epub_item_ids that are already generated."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT epub_item_id FROM chapters WHERE telegram_id IS NOT NULL")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 @router.get("/book/chapters")
 async def get_book_chapters():
@@ -62,25 +81,51 @@ async def get_book_chapters():
         raise HTTPException(status_code=404, detail="EPUB not found")
     try:
         book = epub.read_epub(BOOK_PATH)
+        
+        # 1. Build a map of filenames to Titles from the Table of Contents
         title_map = {}
         def process_toc(toc_list):
             for item in toc_list:
                 if isinstance(item, tuple):
-                    title_map[item[0].href] = item[0].title
+                    if len(item) > 0 and hasattr(item[0], 'href'):
+                        title_map[item[0].href.split('#')[0]] = item[0].title
                     if len(item) > 1: process_toc(item[1])
                 elif hasattr(item, 'href'):
-                    title_map[item.href] = item.title
+                    title_map[item.href.split('#')[0]] = item.title
 
         process_toc(book.toc)
+
         chapters = []
-        for item in book.get_items_of_type(9):
-            pretty_name = title_map.get(item.get_name(), item.get_name())
-            if pretty_name == item.get_name():
-                pretty_name = pretty_name.replace('OEBPS/', '').replace('.html', '').replace('.xhtml', '').replace('-', ' ').title()
-            chapters.append({"id": item.get_id(), "name": pretty_name})
+        # 2. Iterate through HTML items
+        for item in book.get_items_of_type(9): # 9 is standard for HTML/XHTML documents
+            item_id = item.get_id()
+            file_name = item.get_name()
+            
+            # Try to find a pretty name:
+            # First choice: TOC Title
+            # Second choice: Internal item title
+            # Third choice: Cleaned file name
+            pretty_name = title_map.get(file_name)
+            
+            if not pretty_name:
+                # Fallback: Clean up "OEBPS/chapter-1.html" to "Chapter 1"
+                base_name = os.path.basename(file_name)
+                pretty_name = os.path.splitext(base_name)[0].replace('-', ' ').replace('_', ' ').title()
+
+            # Filter out tiny items (like cover images or empty pages)
+            content_length = len(item.get_content())
+            if content_length > 200: 
+                chapters.append({
+                    "id": item_id, 
+                    "name": pretty_name,
+                    "file": file_name
+                })
+                
         return chapters
     except Exception as e:
+        print(f"EPUB Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/book/chapter-content/{item_id}")
 async def get_chapter_content(item_id: str):
@@ -101,45 +146,31 @@ async def post_chapter(request: ChapterRequest):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # 1. Check if chapter exists in database
-    cursor.execute("SELECT telegram_id, metadata_json FROM chapters WHERE book_slug=? AND chapter_slug=?", 
-                   (book_slug, chapter_slug))
+    # Check cache by epub_item_id (more reliable than slugs)
+    cursor.execute("SELECT telegram_id, metadata_json FROM chapters WHERE book_slug=? AND epub_item_id=?", 
+                   (book_slug, request.epub_item_id))
     row = cursor.fetchone()
 
-    # 2. If exists, fetch the URL from Telegram
     if row and row[0]:
         tg_url = get_telegram_file_url(row[0])
         if tg_url:
             conn.close()
-            return {
-                "audio_url": tg_url,
-                "metadata": json.loads(row[1]),
-                "cached": True
-            }
+            return {"audio_url": tg_url, "metadata": json.loads(row[1]), "cached": True}
 
-    # 3. Otherwise, Generate New Audio
-    # Note: ensure generate_full_chapter returns 4 values: bytes, metadata, time, AND tg_file_id
     audio_bytes, metadata, gen_time, tg_file_id = generate_full_chapter(
         request.text, request.voice, request.speed, chapter_slug
     )
 
-    # 4. Save to DB
     if tg_file_id:
         cursor.execute("""
-            INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, telegram_id, metadata_json) 
-            VALUES (?, ?, ?, ?)
-        """, (book_slug, chapter_slug, tg_file_id, json.dumps(metadata)))
+            INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, epub_item_id, telegram_id, metadata_json) 
+            VALUES (?, ?, ?, ?, ?)
+        """, (book_slug, chapter_slug, request.epub_item_id, tg_file_id, json.dumps(metadata)))
         conn.commit()
     
     conn.close()
-
-    return {
-        "audio": base64.b64encode(audio_bytes).decode("utf-8"),
-        "metadata": metadata,
-        "cached": False,
-        "telegram_id": tg_file_id
-    }
-
+    return {"audio": base64.b64encode(audio_bytes).decode("utf-8"), "metadata": metadata, "cached": False}
+    
 # --- FRONTEND UI ---
 
 @router.get("/tts-test")
@@ -256,20 +287,26 @@ async def tts_test_page():
                     body: JSON.stringify({ 
                         text: txtData.content, 
                         voice: document.getElementById('voice').value,
+                        speed: parseFloat(document.getElementById('speed').value), // Added speed
                         book_title: "mvs-1401-2100",
-                        chapter_name: name 
+                        chapter_name: name,
+                        epub_item_id: id  // <--- THIS IS THE CRITICAL ADDITION
                     })
                 });
                 const ttsData = await ttsRes.json();
                 
                 metadata = ttsData.metadata || [];
                 
-                // --- FETCH LOGIC ---
+                // Check if it was cached or freshly generated
+                if (ttsData.cached) {
+                    console.log("Success: Playing from Cache");
+                } else {
+                    console.log("Note: Fresh generation triggered");
+                }
+
                 if (ttsData.audio_url) {
-                    console.log("Playing from Telegram Cache");
                     audio.src = ttsData.audio_url;
                 } else {
-                    console.log("Playing from Fresh Generation");
                     audio.src = "data:audio/mpeg;base64," + ttsData.audio;
                 }
 
@@ -321,3 +358,239 @@ async def tts_test_page():
     </body>
     </html>
     """)
+
+@router.get("/admin")
+async def admin_dashboard():
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Audiobook Admin | Control Center</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+        <style>
+            :root { --accent: #007aff; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --success: #10b981; }
+            body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 40px; }
+            .container { max-width: 1150px; margin: 0 auto; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+            
+            /* Search Box */
+            .search-container { position: relative; margin-bottom: 20px; }
+            .search-container i { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); color: #64748b; }
+            #chapterSearch { width: 100%; padding: 12px 15px 12px 45px; background: #111827; border: 1px solid #334155; border-radius: 12px; color: white; outline: none; transition: 0.2s; box-sizing: border-box; }
+            #chapterSearch:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.2); }
+
+            .actions-bar { 
+                margin-bottom: 20px; display: flex; gap: 12px; align-items: center; background: #111827; padding: 15px 20px; 
+                border-radius: 12px; border: 1px solid #334155; position: sticky; top: 20px; z-index: 100; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+            }
+            
+            table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid #334155; }
+            th { text-align: left; padding: 15px; background: #111827; color: #64748b; font-size: 0.75rem; text-transform: uppercase; }
+            td { padding: 12px 15px; border-top: 1px solid #334155; font-size: 0.9rem; }
+            
+            input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--accent); cursor: pointer; }
+            input[type="number"] { background: #1e293b; color: white; border: 1px solid #475569; padding: 6px; border-radius: 6px; width: 60px; outline: none; }
+            select { background: #1e293b; color: white; border: 1px solid #475569; padding: 7px; border-radius: 6px; outline: none; }
+
+            .status-pill { padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: bold; }
+            .status-ready { background: rgba(16, 185, 129, 0.1); color: var(--success); }
+            .status-missing { background: rgba(244, 63, 94, 0.1); color: #f43f5e; }
+            
+            .gen-btn { background: var(--accent); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
+            .batch-btn { background: var(--success); }
+            .range-btn { background: #475569; font-size: 0.8rem; }
+            .gen-btn:disabled { background: #334155; opacity: 0.5; }
+            
+            .loader { border: 2px solid #f3f3f3; border-top: 2px solid var(--accent); border-radius: 50%; width: 14px; height: 14px; animation: spin 1s linear infinite; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            tr.processing { background: rgba(0, 122, 255, 0.08); }
+            .hidden { display: none !important; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Chapter Management</h1>
+                <div id="stats" style="color: #94a3b8; font-family: monospace;">Syncing...</div>
+            </div>
+
+            <div class="search-container">
+                <i class="fas fa-search"></i>
+                <input type="text" id="chapterSearch" placeholder="Search by title or chapter number..." onkeyup="filterChapters()">
+            </div>
+
+            <div class="actions-bar">
+                <input type="checkbox" id="selectAll" onclick="toggleAll(this)">
+                
+                <div style="display: flex; align-items: center; gap: 8px; border-left: 1px solid #334155; padding-left: 15px;">
+                    <span style="font-size: 0.8rem; color: #64748b;">RANGE:</span>
+                    <input type="number" id="rangeFrom" placeholder="From">
+                    <span style="color: #64748b;">-</span>
+                    <input type="number" id="rangeTo" placeholder="To">
+                    <button class="gen-btn range-btn" onclick="selectRange()">Select</button>
+                </div>
+
+                <div style="border-left: 1px solid #334155; height: 25px; margin: 0 5px;"></div>
+
+                <select id="batchVoice">
+                    <option value="af_heart">af_heart (F)</option>
+                    <option value="af_bella">af_bella (F)</option>
+                    <option value="am_adam" selected>am_adam (M)</option>
+                </select>
+
+                <select id="batchSpeed">
+                    <option value="1.0">1.0x</option>
+                    <option value="1.2" selected>1.2x</option>
+                    <option value="1.5">1.5x</option>
+                </select>
+
+                <button class="gen-btn batch-btn" id="batchBtn" onclick="generateSelected()" style="margin-left: auto;">
+                    <i class="fas fa-play"></i> Batch Generate
+                </button>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 30px;">#</th>
+                        <th style="width: 40px;">ID</th>
+                        <th>Chapter Title</th>
+                        <th>Status</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="chapterBody"></tbody>
+            </table>
+        </div>
+
+        <script>
+            let allChapters = [];
+            let readyIds = [];
+
+            async function loadAdmin() {
+                const [chapRes, statusRes] = await Promise.all([
+                    fetch('/book/chapters'),
+                    fetch('/book/status')
+                ]);
+                allChapters = await chapRes.json();
+                readyIds = await statusRes.json();
+                renderTable(allChapters);
+            }
+
+            function renderTable(data) {
+                document.getElementById('chapterBody').innerHTML = data.map((c, index) => {
+                    const isReady = readyIds.includes(c.id);
+                    const rowNum = index + 1; 
+                    return `
+                    <tr id="row-${c.id}" class="chapter-row" data-index="${rowNum}" data-title="${c.name.toLowerCase()}">
+                        <td><input type="checkbox" class="chapter-check" data-id="${c.id}" data-name="${c.name}" data-idx="${rowNum}"></td>
+                        <td style="font-family: monospace; color: #64748b; font-size: 0.7rem;">${rowNum}</td>
+                        <td style="font-weight: 500;">${c.name}</td>
+                        <td id="status-${c.id}">
+                            ${isReady ? '<span class="status-pill status-ready">Cloud Ready</span>' : '<span class="status-pill status-missing">Missing</span>'}
+                        </td>
+                        <td>
+                            <button class="gen-btn" id="btn-${c.id}" onclick="generate('${c.id}', '${c.name}')">
+                                <i class="fas fa-play"></i>
+                            </button>
+                        </td>
+                    </tr>`;
+                }).join('');
+                document.getElementById('stats').innerText = `TOTAL: ${allChapters.length} | READY: ${readyIds.length}`;
+            }
+
+            function filterChapters() {
+                const query = document.getElementById('chapterSearch').value.toLowerCase();
+                const rows = document.querySelectorAll('.chapter-row');
+                
+                rows.forEach(row => {
+                    const title = row.getAttribute('data-title');
+                    const index = row.getAttribute('data-index');
+                    if (title.includes(query) || index.includes(query)) {
+                        row.classList.remove('hidden');
+                    } else {
+                        row.classList.add('hidden');
+                    }
+                });
+            }
+
+            function selectRange() {
+                const from = parseInt(document.getElementById('rangeFrom').value);
+                const to = parseInt(document.getElementById('rangeTo').value);
+                if (isNaN(from) || isNaN(to)) return alert("Enter valid row numbers");
+
+                const checks = document.querySelectorAll('.chapter-row:not(.hidden) .chapter-check');
+                checks.forEach(cb => {
+                    const idx = parseInt(cb.getAttribute('data-idx'));
+                    cb.checked = (idx >= from && idx <= to);
+                });
+            }
+
+            function toggleAll(source) {
+                const visibleCheckboxes = document.querySelectorAll('.chapter-row:not(.hidden) .chapter-check');
+                visibleCheckboxes.forEach(cb => cb.checked = source.checked);
+            }
+
+            async function generateSelected() {
+                const selected = Array.from(document.querySelectorAll('.chapter-check:checked'));
+                if (selected.length === 0) return alert("Select chapters first");
+                if (!confirm(`Generate ${selected.length} chapters?`)) return;
+
+                const batchBtn = document.getElementById('batchBtn');
+                batchBtn.disabled = true;
+                
+                for (const check of selected) {
+                    const id = check.getAttribute('data-id');
+                    const name = check.getAttribute('data-name');
+                    const row = document.getElementById('row-' + id);
+                    row.classList.add('processing');
+                    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    await generate(id, name); 
+                    row.classList.remove('processing');
+                    check.checked = false;
+                }
+                batchBtn.disabled = false;
+                alert("Batch complete!");
+            }
+
+            async function generate(id, name) {
+                const btn = document.getElementById('btn-' + id);
+                const statusTd = document.getElementById('status-' + id);
+                const voice = document.getElementById('batchVoice').value;
+                const speed = parseFloat(document.getElementById('batchSpeed').value);
+
+                btn.disabled = true;
+                btn.innerHTML = '<div class="loader"></div>';
+                
+                try {
+                    const txtRes = await fetch('/book/chapter-content/' + id);
+                    const txtData = await txtRes.json();
+                    const ttsRes = await fetch('/tts/chapter', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ 
+                            text: txtData.content, 
+                            chapter_name: name,
+                            epub_item_id: id,
+                            voice: voice,
+                            speed: speed
+                        })
+                    });
+                    if (ttsRes.ok) {
+                        statusTd.innerHTML = '<span class="status-pill status-ready">Cloud Ready</span>';
+                    }
+                } catch (e) {
+                    statusTd.innerHTML = '<span class="status-pill status-missing">Error</span>';
+                } finally { 
+                    btn.disabled = false; 
+                    btn.innerHTML = '<i class="fas fa-play"></i>';
+                }
+            }
+
+            loadAdmin();
+        </script>
+    </body>
+    </html>
+    """)
+
+
