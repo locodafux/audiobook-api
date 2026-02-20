@@ -10,32 +10,35 @@ from ebooklib import epub
 from bs4 import BeautifulSoup
 from pathlib import Path
 
-# Importing the service
-from app.services.kokoro_service import generate_full_chapter
+# Importing the services
+from app.services.kokoro_service import generate_full_chapter, upload_to_telegram, get_telegram_file_url
 
 router = APIRouter()
 
 # --- PATH LOGIC ---
 CURRENT_FILE = Path(__file__).resolve()
 APP_ROOT = CURRENT_FILE.parent.parent
-# Database is "outside app", so we go one level up from APP_ROOT
 DB_PATH = os.path.join(APP_ROOT.parent, "test.db")
 BOOK_PATH = os.path.join(APP_ROOT, "storage", "books", "mvs-1401-2100.epub")
-AUDIO_STORAGE = os.path.join(APP_ROOT, "storage", "audio")
 
 # --- DATABASE INIT ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chapters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_slug TEXT,
-            chapter_slug TEXT,
-            metadata_json TEXT,
-            UNIQUE(book_slug, chapter_slug)
-        )
+    CREATE TABLE IF NOT EXISTS chapters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        book_slug TEXT,
+        chapter_slug TEXT,
+        telegram_id TEXT,
+        metadata_json TEXT,
+        UNIQUE(book_slug, chapter_slug)
+    )
     ''')
+    try:
+        cursor.execute("ALTER TABLE chapters ADD COLUMN telegram_id TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -92,62 +95,50 @@ async def get_chapter_content(item_id: str):
 
 @router.post("/tts/chapter")
 async def post_chapter(request: ChapterRequest):
-    try:
-        book_slug = slugify(request.book_title)
-        chapter_slug = slugify(request.chapter_name)
-        file_name = f"{chapter_slug}.mp3"
-        save_dir = os.path.join(AUDIO_STORAGE, book_slug)
-        file_path = os.path.join(save_dir, file_name)
+    book_slug = slugify(request.book_title)
+    chapter_slug = slugify(request.chapter_name)
 
-        # 1. Check Cache
-        if os.path.exists(file_path):
-            print(f"DEBUG: Loading {file_name} from cache")
-            with open(file_path, "rb") as f:
-                audio_bytes = f.read()
-            
-            # Fetch metadata from SQLite
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT metadata_json FROM chapters WHERE book_slug=? AND chapter_slug=?", (book_slug, chapter_slug))
-            row = cursor.fetchone()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 1. Check if chapter exists in database
+    cursor.execute("SELECT telegram_id, metadata_json FROM chapters WHERE book_slug=? AND chapter_slug=?", 
+                   (book_slug, chapter_slug))
+    row = cursor.fetchone()
+
+    # 2. If exists, fetch the URL from Telegram
+    if row and row[0]:
+        tg_url = get_telegram_file_url(row[0])
+        if tg_url:
             conn.close()
-            
-            cached_metadata = json.loads(row[0]) if row else []
-            
             return {
-                "audio": base64.b64encode(audio_bytes).decode("utf-8"),
-                "metadata": cached_metadata,
+                "audio_url": tg_url,
+                "metadata": json.loads(row[1]),
                 "cached": True
             }
 
-        # 2. Generate New
-        audio_bytes, metadata, gen_time = generate_full_chapter(
-            request.text, request.voice, request.speed
-        )
+    # 3. Otherwise, Generate New Audio
+    # Note: ensure generate_full_chapter returns 4 values: bytes, metadata, time, AND tg_file_id
+    audio_bytes, metadata, gen_time, tg_file_id = generate_full_chapter(
+        request.text, request.voice, request.speed, chapter_slug
+    )
 
-        # 3. Save MP3 to Storage
-        os.makedirs(save_dir, exist_ok=True)
-        with open(file_path, "wb") as f:
-            f.write(audio_bytes)
-
-        # 4. Save Metadata to SQLite
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, metadata_json) VALUES (?, ?, ?)",
-            (book_slug, chapter_slug, json.dumps(metadata))
-        )
+    # 4. Save to DB
+    if tg_file_id:
+        cursor.execute("""
+            INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, telegram_id, metadata_json) 
+            VALUES (?, ?, ?, ?)
+        """, (book_slug, chapter_slug, tg_file_id, json.dumps(metadata)))
         conn.commit()
-        conn.close()
+    
+    conn.close()
 
-        return {
-            "audio": base64.b64encode(audio_bytes).decode("utf-8"),
-            "metadata": metadata,
-            "generation_time": gen_time,
-            "cached": False
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "audio": base64.b64encode(audio_bytes).decode("utf-8"),
+        "metadata": metadata,
+        "cached": False,
+        "telegram_id": tg_file_id
+    }
 
 # --- FRONTEND UI ---
 
@@ -272,7 +263,16 @@ async def tts_test_page():
                 const ttsData = await ttsRes.json();
                 
                 metadata = ttsData.metadata || [];
-                audio.src = "data:audio/wav;base64," + ttsData.audio;
+                
+                // --- FETCH LOGIC ---
+                if (ttsData.audio_url) {
+                    console.log("Playing from Telegram Cache");
+                    audio.src = ttsData.audio_url;
+                } else {
+                    console.log("Playing from Fresh Generation");
+                    audio.src = "data:audio/mpeg;base64," + ttsData.audio;
+                }
+
                 audio.playbackRate = document.getElementById('speed').value;
                 document.getElementById('status').classList.add('hidden');
                 toggle(true);
@@ -305,8 +305,7 @@ async def tts_test_page():
                     const cur = metadata.find(s => audio.currentTime >= s.start && audio.currentTime <= s.end);
                     if (cur) document.getElementById('display').innerText = cur.text;
                 } else {
-                    // Fallback text if playing from cache without metadata
-                    document.getElementById('display').innerText = "Playing from cache...";
+                    document.getElementById('display').innerText = "Playing...";
                 }
             };
 
