@@ -3,7 +3,8 @@ import os
 import re
 import json
 import sqlite3
-from fastapi import APIRouter, HTTPException
+from typing import List
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from ebooklib import epub
@@ -25,8 +26,6 @@ BOOK_PATH = os.path.join(APP_ROOT, "storage", "books", "mvs-1401-2100.epub")
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Updated Table: added 'epub_item_id' to link back to the EPUB file structure
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,14 +37,6 @@ def init_db():
         UNIQUE(book_slug, epub_item_id)
     )
     ''')
-    
-    # Migrations for existing DBs
-    columns = [row[1] for row in cursor.execute("PRAGMA table_info(chapters)")]
-    if "telegram_id" not in columns:
-        cursor.execute("ALTER TABLE chapters ADD COLUMN telegram_id TEXT")
-    if "epub_item_id" not in columns:
-        cursor.execute("ALTER TABLE chapters ADD COLUMN epub_item_id TEXT")
-        
     conn.commit()
     conn.close()
 
@@ -60,14 +51,53 @@ class ChapterRequest(BaseModel):
     speed: float = 1.0
     book_title: str = "mvs-1401-2100"
     chapter_name: str = "chapter"
-    epub_item_id: str = "" # Added to request
+    epub_item_id: str = ""
 
+# --- BACKGROUND WORKER ---
+def process_chapter_task(request: ChapterRequest):
+    """The heavy lifting function that runs outside the main request flow."""
+    book_slug = slugify(request.book_title)
+    chapter_slug = slugify(request.chapter_name)
+
+    # 1. Check if already exists to avoid redundant work
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id FROM chapters WHERE book_slug=? AND epub_item_id=?", 
+                   (book_slug, request.epub_item_id))
+    row = cursor.fetchone()
     
+    if row and row[0]:
+        conn.close()
+        return
+
+    # 2. Generate and Upload
+    try:
+        audio_bytes, metadata, gen_time, tg_file_id = generate_full_chapter(
+            request.text, request.voice, request.speed, chapter_slug
+        )
+
+        if tg_file_id:
+            cursor.execute("""
+                INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, epub_item_id, telegram_id, metadata_json) 
+                VALUES (?, ?, ?, ?, ?)
+            """, (book_slug, chapter_slug, request.epub_item_id, tg_file_id, json.dumps(metadata)))
+            conn.commit()
+    except Exception as e:
+        print(f"Background Task Error: {e}")
+    finally:
+        conn.close()
+
 # --- API ENDPOINTS ---
+
+@router.post("/tts/batch")
+async def post_batch_chapters(requests: List[ChapterRequest], background_tasks: BackgroundTasks):
+    """Endpoint specifically for the Admin panel to fire and forget."""
+    for req in requests:
+        background_tasks.add_task(process_chapter_task, req)
+    return {"status": "Batch processing started", "count": len(requests)}
 
 @router.get("/book/status")
 async def get_generation_status():
-    """Returns a list of epub_item_ids that are already generated."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT epub_item_id FROM chapters WHERE telegram_id IS NOT NULL")
@@ -81,8 +111,6 @@ async def get_book_chapters():
         raise HTTPException(status_code=404, detail="EPUB not found")
     try:
         book = epub.read_epub(BOOK_PATH)
-        
-        # 1. Build a map of filenames to Titles from the Table of Contents
         title_map = {}
         def process_toc(toc_list):
             for item in toc_list:
@@ -92,40 +120,20 @@ async def get_book_chapters():
                     if len(item) > 1: process_toc(item[1])
                 elif hasattr(item, 'href'):
                     title_map[item.href.split('#')[0]] = item.title
-
         process_toc(book.toc)
-
         chapters = []
-        # 2. Iterate through HTML items
-        for item in book.get_items_of_type(9): # 9 is standard for HTML/XHTML documents
+        for item in book.get_items_of_type(9):
             item_id = item.get_id()
             file_name = item.get_name()
-            
-            # Try to find a pretty name:
-            # First choice: TOC Title
-            # Second choice: Internal item title
-            # Third choice: Cleaned file name
             pretty_name = title_map.get(file_name)
-            
             if not pretty_name:
-                # Fallback: Clean up "OEBPS/chapter-1.html" to "Chapter 1"
                 base_name = os.path.basename(file_name)
                 pretty_name = os.path.splitext(base_name)[0].replace('-', ' ').replace('_', ' ').title()
-
-            # Filter out tiny items (like cover images or empty pages)
-            content_length = len(item.get_content())
-            if content_length > 200: 
-                chapters.append({
-                    "id": item_id, 
-                    "name": pretty_name,
-                    "file": file_name
-                })
-                
+            if len(item.get_content()) > 200: 
+                chapters.append({"id": item_id, "name": pretty_name, "file": file_name})
         return chapters
     except Exception as e:
-        print(f"EPUB Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/book/chapter-content/{item_id}")
 async def get_chapter_content(item_id: str):
@@ -142,36 +150,29 @@ async def get_chapter_content(item_id: str):
 async def post_chapter(request: ChapterRequest):
     book_slug = slugify(request.book_title)
     chapter_slug = slugify(request.chapter_name)
-
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Check cache by epub_item_id (more reliable than slugs)
     cursor.execute("SELECT telegram_id, metadata_json FROM chapters WHERE book_slug=? AND epub_item_id=?", 
                    (book_slug, request.epub_item_id))
     row = cursor.fetchone()
-
     if row and row[0]:
         tg_url = get_telegram_file_url(row[0])
         if tg_url:
             conn.close()
             return {"audio_url": tg_url, "metadata": json.loads(row[1]), "cached": True}
-
+    
+    # Still synchronous for single-play requests so user gets audio immediately
     audio_bytes, metadata, gen_time, tg_file_id = generate_full_chapter(
         request.text, request.voice, request.speed, chapter_slug
     )
-
     if tg_file_id:
         cursor.execute("""
             INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, epub_item_id, telegram_id, metadata_json) 
             VALUES (?, ?, ?, ?, ?)
         """, (book_slug, chapter_slug, request.epub_item_id, tg_file_id, json.dumps(metadata)))
         conn.commit()
-    
     conn.close()
     return {"audio": base64.b64encode(audio_bytes).decode("utf-8"), "metadata": metadata, "cached": False}
-    
-# --- FRONTEND UI ---
 
 @router.get("/tts-test")
 async def tts_test_page():
@@ -395,6 +396,7 @@ async def admin_dashboard():
             .status-pill { padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: bold; }
             .status-ready { background: rgba(16, 185, 129, 0.1); color: var(--success); }
             .status-missing { background: rgba(244, 63, 94, 0.1); color: #f43f5e; }
+            .status-queued { background: rgba(0, 122, 255, 0.1); color: var(--accent); }
             
             .gen-btn { background: var(--accent); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
             .batch-btn { background: var(--success); }
@@ -534,23 +536,51 @@ async def admin_dashboard():
             async function generateSelected() {
                 const selected = Array.from(document.querySelectorAll('.chapter-check:checked'));
                 if (selected.length === 0) return alert("Select chapters first");
-                if (!confirm(`Generate ${selected.length} chapters?`)) return;
+                if (!confirm(`Generate ${selected.length} chapters in background?`)) return;
 
                 const batchBtn = document.getElementById('batchBtn');
                 batchBtn.disabled = true;
                 
+                const voice = document.getElementById('batchVoice').value;
+                const speed = parseFloat(document.getElementById('batchSpeed').value);
+                
+                const batchRequests = [];
+
                 for (const check of selected) {
                     const id = check.getAttribute('data-id');
                     const name = check.getAttribute('data-name');
-                    const row = document.getElementById('row-' + id);
-                    row.classList.add('processing');
-                    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    await generate(id, name); 
-                    row.classList.remove('processing');
+                    
+                    // Visual feedback
+                    document.getElementById(`status-${id}`).innerHTML = '<span class="status-pill status-queued">Queuing...</span>';
+
+                    // Fetch content for each
+                    const txtRes = await fetch('/book/chapter-content/' + id);
+                    const txtData = await txtRes.json();
+                    
+                    batchRequests.push({
+                        text: txtData.content,
+                        voice: voice,
+                        speed: speed,
+                        book_title: "mvs-1401-2100",
+                        chapter_name: name,
+                        epub_item_id: id
+                    });
+                    
                     check.checked = false;
                 }
+
+                // Send to background route
+                const res = await fetch('/tts/batch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(batchRequests)
+                });
+
+                if (res.ok) {
+                    console.log("Batch accepted by background worker.");
+                }
+
                 batchBtn.disabled = false;
-                alert("Batch complete!");
             }
 
             async function generate(id, name) {
@@ -587,10 +617,23 @@ async def admin_dashboard():
                 }
             }
 
+            // Auto-refresh status every 5 seconds to show background progress
+            setInterval(async () => {
+                const statusRes = await fetch('/book/status');
+                readyIds = await statusRes.json();
+                
+                allChapters.forEach(c => {
+                    const statusTd = document.getElementById(`status-${c.id}`);
+                    if (readyIds.includes(c.id)) {
+                        statusTd.innerHTML = '<span class="status-pill status-ready">Cloud Ready</span>';
+                    }
+                });
+                document.getElementById('stats').innerText = `TOTAL: ${allChapters.length} | READY: ${readyIds.length}`;
+            }, 5000);
+
             loadAdmin();
         </script>
     </body>
     </html>
     """)
-
 
