@@ -3,6 +3,7 @@ import os
 import re
 import json
 import sqlite3
+import asyncio
 from typing import List
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
@@ -10,6 +11,8 @@ from pydantic import BaseModel
 from ebooklib import epub
 from bs4 import BeautifulSoup
 from pathlib import Path
+import requests
+from fastapi.responses import FileResponse
 
 # Importing the services
 from app.services.kokoro_service import generate_full_chapter, upload_to_telegram, get_telegram_file_url
@@ -21,6 +24,10 @@ CURRENT_FILE = Path(__file__).resolve()
 APP_ROOT = CURRENT_FILE.parent.parent
 DB_PATH = os.path.join(APP_ROOT.parent, "test.db")
 BOOK_PATH = os.path.join(APP_ROOT, "storage", "books", "mvs-1401-2100.epub")
+
+# --- GLOBAL TRACKER & QUEUE ---
+ACTIVE_QUEUE = set()
+TASK_QUEUE = asyncio.Queue()
 
 # --- DATABASE INIT ---
 def init_db():
@@ -53,48 +60,63 @@ class ChapterRequest(BaseModel):
     chapter_name: str = "chapter"
     epub_item_id: str = ""
 
-# --- BACKGROUND WORKER ---
-def process_chapter_task(request: ChapterRequest):
-    """The heavy lifting function that runs outside the main request flow."""
+# --- SEQUENTIAL WORKER ---
+async def background_worker():
+    """Loops forever, picking up one task at a time from the queue."""
+    while True:
+        request = await TASK_QUEUE.get()
+        ACTIVE_QUEUE.add(request.epub_item_id)
+        
+        try:
+            # Run the heavy TTS in a thread to avoid blocking the event loop
+            await asyncio.to_thread(process_single_chapter, request)
+        except Exception as e:
+            print(f"Worker Error: {e}")
+        finally:
+            ACTIVE_QUEUE.discard(request.epub_item_id)
+            TASK_QUEUE.task_done()
+
+def process_single_chapter(request: ChapterRequest):
+    """Actual TTS logic executed by the worker."""
     book_slug = slugify(request.book_title)
     chapter_slug = slugify(request.chapter_name)
 
-    # 1. Check if already exists to avoid redundant work
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Check if exists
     cursor.execute("SELECT telegram_id FROM chapters WHERE book_slug=? AND epub_item_id=?", 
                    (book_slug, request.epub_item_id))
-    row = cursor.fetchone()
-    
-    if row and row[0]:
+    if cursor.fetchone():
         conn.close()
         return
 
-    # 2. Generate and Upload
     try:
         audio_bytes, metadata, gen_time, tg_file_id = generate_full_chapter(
             request.text, request.voice, request.speed, chapter_slug
         )
-
         if tg_file_id:
             cursor.execute("""
                 INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, epub_item_id, telegram_id, metadata_json) 
                 VALUES (?, ?, ?, ?, ?)
             """, (book_slug, chapter_slug, request.epub_item_id, tg_file_id, json.dumps(metadata)))
             conn.commit()
-    except Exception as e:
-        print(f"Background Task Error: {e}")
     finally:
         conn.close()
+
+# Start the worker task when the module loads
+@router.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_worker())
 
 # --- API ENDPOINTS ---
 
 @router.post("/tts/batch")
-async def post_batch_chapters(requests: List[ChapterRequest], background_tasks: BackgroundTasks):
-    """Endpoint specifically for the Admin panel to fire and forget."""
+async def post_batch_chapters(requests: List[ChapterRequest]):
+    """Adds all requests to the sequential queue."""
     for req in requests:
-        background_tasks.add_task(process_chapter_task, req)
-    return {"status": "Batch processing started", "count": len(requests)}
+        await TASK_QUEUE.put(req)
+    return {"status": "Added to queue", "count": len(requests)}
 
 @router.get("/book/status")
 async def get_generation_status():
@@ -104,6 +126,10 @@ async def get_generation_status():
     rows = cursor.fetchall()
     conn.close()
     return [row[0] for row in rows]
+
+@router.get("/book/queue")
+async def get_active_queue():
+    return list(ACTIVE_QUEUE)
 
 @router.get("/book/chapters")
 async def get_book_chapters():
@@ -161,7 +187,6 @@ async def post_chapter(request: ChapterRequest):
             conn.close()
             return {"audio_url": tg_url, "metadata": json.loads(row[1]), "cached": True}
     
-    # Still synchronous for single-play requests so user gets audio immediately
     audio_bytes, metadata, gen_time, tg_file_id = generate_full_chapter(
         request.text, request.voice, request.speed, chapter_slug
     )
@@ -173,6 +198,51 @@ async def post_chapter(request: ChapterRequest):
         conn.commit()
     conn.close()
     return {"audio": base64.b64encode(audio_bytes).decode("utf-8"), "metadata": metadata, "cached": False}
+
+
+@router.get("/tts/download/{epub_item_id}")
+async def download_chapter(epub_item_id: str):
+    """
+    Downloads audio from Telegram if cached, saves temporarily, and sends it to mobile.
+    """
+    # --- Get Telegram file ID from DB ---
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id FROM chapters WHERE epub_item_id=?", (epub_item_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="Audio not cached on Telegram")
+
+    tg_file_id = row[0]
+
+    # --- Get file path from Telegram API ---
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="Telegram bot token not set")
+
+    res = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={tg_file_id}")
+    if res.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch Telegram file info")
+
+    file_path = res.json()["result"]["file_path"]
+
+    # --- Download file from Telegram ---
+    tg_file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    r = requests.get(tg_file_url, stream=True)
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to download Telegram audio")
+
+    # --- Save temporarily on server ---
+    temp_path = f"/tmp/{epub_item_id}.mp3"
+    with open(temp_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024*10):
+            f.write(chunk)
+
+    # --- Send file to mobile ---
+    return FileResponse(temp_path, media_type="audio/mpeg", filename=f"{epub_item_id}.mp3")
+
 
 @router.get("/tts-test")
 async def tts_test_page():
@@ -288,23 +358,16 @@ async def tts_test_page():
                     body: JSON.stringify({ 
                         text: txtData.content, 
                         voice: document.getElementById('voice').value,
-                        speed: parseFloat(document.getElementById('speed').value), // Added speed
+                        speed: parseFloat(document.getElementById('speed').value),
                         book_title: "mvs-1401-2100",
                         chapter_name: name,
-                        epub_item_id: id  // <--- THIS IS THE CRITICAL ADDITION
+                        epub_item_id: id
                     })
                 });
                 const ttsData = await ttsRes.json();
                 
                 metadata = ttsData.metadata || [];
                 
-                // Check if it was cached or freshly generated
-                if (ttsData.cached) {
-                    console.log("Success: Playing from Cache");
-                } else {
-                    console.log("Note: Fresh generation triggered");
-                }
-
                 if (ttsData.audio_url) {
                     audio.src = ttsData.audio_url;
                 } else {
@@ -373,36 +436,25 @@ async def admin_dashboard():
             body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 40px; }
             .container { max-width: 1150px; margin: 0 auto; }
             .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-            
-            /* Search Box */
             .search-container { position: relative; margin-bottom: 20px; }
             .search-container i { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); color: #64748b; }
             #chapterSearch { width: 100%; padding: 12px 15px 12px 45px; background: #111827; border: 1px solid #334155; border-radius: 12px; color: white; outline: none; transition: 0.2s; box-sizing: border-box; }
             #chapterSearch:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.2); }
-
-            .actions-bar { 
-                margin-bottom: 20px; display: flex; gap: 12px; align-items: center; background: #111827; padding: 15px 20px; 
-                border-radius: 12px; border: 1px solid #334155; position: sticky; top: 20px; z-index: 100; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
-            }
-            
+            .actions-bar { margin-bottom: 20px; display: flex; gap: 12px; align-items: center; background: #111827; padding: 15px 20px; border-radius: 12px; border: 1px solid #334155; position: sticky; top: 20px; z-index: 100; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3); }
             table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid #334155; }
             th { text-align: left; padding: 15px; background: #111827; color: #64748b; font-size: 0.75rem; text-transform: uppercase; }
             td { padding: 12px 15px; border-top: 1px solid #334155; font-size: 0.9rem; }
-            
             input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--accent); cursor: pointer; }
             input[type="number"] { background: #1e293b; color: white; border: 1px solid #475569; padding: 6px; border-radius: 6px; width: 60px; outline: none; }
             select { background: #1e293b; color: white; border: 1px solid #475569; padding: 7px; border-radius: 6px; outline: none; }
-
             .status-pill { padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: bold; }
             .status-ready { background: rgba(16, 185, 129, 0.1); color: var(--success); }
             .status-missing { background: rgba(244, 63, 94, 0.1); color: #f43f5e; }
             .status-queued { background: rgba(0, 122, 255, 0.1); color: var(--accent); }
-            
             .gen-btn { background: var(--accent); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
             .batch-btn { background: var(--success); }
             .range-btn { background: #475569; font-size: 0.8rem; }
             .gen-btn:disabled { background: #334155; opacity: 0.5; }
-            
             .loader { border: 2px solid #f3f3f3; border-top: 2px solid var(--accent); border-radius: 50%; width: 14px; height: 14px; animation: spin 1s linear infinite; }
             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
             tr.processing { background: rgba(0, 122, 255, 0.08); }
@@ -415,65 +467,28 @@ async def admin_dashboard():
                 <h1>Chapter Management</h1>
                 <div id="stats" style="color: #94a3b8; font-family: monospace;">Syncing...</div>
             </div>
-
-            <div class="search-container">
-                <i class="fas fa-search"></i>
-                <input type="text" id="chapterSearch" placeholder="Search by title or chapter number..." onkeyup="filterChapters()">
-            </div>
-
+            <div class="search-container"><i class="fas fa-search"></i><input type="text" id="chapterSearch" placeholder="Search..." onkeyup="filterChapters()"></div>
             <div class="actions-bar">
                 <input type="checkbox" id="selectAll" onclick="toggleAll(this)">
-                
                 <div style="display: flex; align-items: center; gap: 8px; border-left: 1px solid #334155; padding-left: 15px;">
-                    <span style="font-size: 0.8rem; color: #64748b;">RANGE:</span>
-                    <input type="number" id="rangeFrom" placeholder="From">
-                    <span style="color: #64748b;">-</span>
-                    <input type="number" id="rangeTo" placeholder="To">
+                    <input type="number" id="rangeFrom" placeholder="From"> <span style="color: #64748b;">-</span> <input type="number" id="rangeTo" placeholder="To">
                     <button class="gen-btn range-btn" onclick="selectRange()">Select</button>
                 </div>
-
-                <div style="border-left: 1px solid #334155; height: 25px; margin: 0 5px;"></div>
-
-                <select id="batchVoice">
-                    <option value="af_heart">af_heart (F)</option>
-                    <option value="af_bella">af_bella (F)</option>
-                    <option value="am_adam" selected>am_adam (M)</option>
-                </select>
-
-                <select id="batchSpeed">
-                    <option value="1.0">1.0x</option>
-                    <option value="1.2" selected>1.2x</option>
-                    <option value="1.5">1.5x</option>
-                </select>
-
-                <button class="gen-btn batch-btn" id="batchBtn" onclick="generateSelected()" style="margin-left: auto;">
-                    <i class="fas fa-play"></i> Batch Generate
-                </button>
+                <select id="batchVoice"><option value="af_heart">af_heart (F)</option><option value="am_adam" selected>am_adam (M)</option></select>
+                <select id="batchSpeed"><option value="1.0">1.0x</option><option value="1.2" selected>1.2x</option></select>
+                <button class="gen-btn batch-btn" id="batchBtn" onclick="generateSelected()" style="margin-left: auto;"><i class="fas fa-play"></i> Batch Generate</button>
             </div>
-
             <table>
-                <thead>
-                    <tr>
-                        <th style="width: 30px;">#</th>
-                        <th style="width: 40px;">ID</th>
-                        <th>Chapter Title</th>
-                        <th>Status</th>
-                        <th>Action</th>
-                    </tr>
-                </thead>
+                <thead><tr><th style="width: 30px;">#</th><th style="width: 40px;">ID</th><th>Chapter Title</th><th>Status</th><th>Action</th></tr></thead>
                 <tbody id="chapterBody"></tbody>
             </table>
         </div>
-
         <script>
             let allChapters = [];
             let readyIds = [];
 
             async function loadAdmin() {
-                const [chapRes, statusRes] = await Promise.all([
-                    fetch('/book/chapters'),
-                    fetch('/book/status')
-                ]);
+                const [chapRes, statusRes] = await Promise.all([fetch('/book/chapters'), fetch('/book/status')]);
                 allChapters = await chapRes.json();
                 readyIds = await statusRes.json();
                 renderTable(allChapters);
@@ -483,19 +498,12 @@ async def admin_dashboard():
                 document.getElementById('chapterBody').innerHTML = data.map((c, index) => {
                     const isReady = readyIds.includes(c.id);
                     const rowNum = index + 1; 
-                    return `
-                    <tr id="row-${c.id}" class="chapter-row" data-index="${rowNum}" data-title="${c.name.toLowerCase()}">
+                    return `<tr id="row-${c.id}" class="chapter-row" data-index="${rowNum}" data-title="${c.name.toLowerCase()}">
                         <td><input type="checkbox" class="chapter-check" data-id="${c.id}" data-name="${c.name}" data-idx="${rowNum}"></td>
                         <td style="font-family: monospace; color: #64748b; font-size: 0.7rem;">${rowNum}</td>
                         <td style="font-weight: 500;">${c.name}</td>
-                        <td id="status-${c.id}">
-                            ${isReady ? '<span class="status-pill status-ready">Cloud Ready</span>' : '<span class="status-pill status-missing">Missing</span>'}
-                        </td>
-                        <td>
-                            <button class="gen-btn" id="btn-${c.id}" onclick="generate('${c.id}', '${c.name}')">
-                                <i class="fas fa-play"></i>
-                            </button>
-                        </td>
+                        <td id="status-${c.id}">${isReady ? '<span class="status-pill status-ready">Cloud Ready</span>' : '<span class="status-pill status-missing">Missing</span>'}</td>
+                        <td><button class="gen-btn" id="btn-${c.id}" onclick="generate('${c.id}', '${c.name}')"><i class="fas fa-play"></i></button></td>
                     </tr>`;
                 }).join('');
                 document.getElementById('stats').innerText = `TOTAL: ${allChapters.length} | READY: ${readyIds.length}`;
@@ -503,132 +511,61 @@ async def admin_dashboard():
 
             function filterChapters() {
                 const query = document.getElementById('chapterSearch').value.toLowerCase();
-                const rows = document.querySelectorAll('.chapter-row');
-                
-                rows.forEach(row => {
+                document.querySelectorAll('.chapter-row').forEach(row => {
                     const title = row.getAttribute('data-title');
                     const index = row.getAttribute('data-index');
-                    if (title.includes(query) || index.includes(query)) {
-                        row.classList.remove('hidden');
-                    } else {
-                        row.classList.add('hidden');
-                    }
+                    row.classList.toggle('hidden', !title.includes(query) && !index.includes(query));
                 });
             }
 
             function selectRange() {
                 const from = parseInt(document.getElementById('rangeFrom').value);
                 const to = parseInt(document.getElementById('rangeTo').value);
-                if (isNaN(from) || isNaN(to)) return alert("Enter valid row numbers");
-
-                const checks = document.querySelectorAll('.chapter-row:not(.hidden) .chapter-check');
-                checks.forEach(cb => {
+                if (isNaN(from) || isNaN(to)) return alert("Enter valid numbers");
+                document.querySelectorAll('.chapter-row:not(.hidden) .chapter-check').forEach(cb => {
                     const idx = parseInt(cb.getAttribute('data-idx'));
                     cb.checked = (idx >= from && idx <= to);
                 });
             }
 
-            function toggleAll(source) {
-                const visibleCheckboxes = document.querySelectorAll('.chapter-row:not(.hidden) .chapter-check');
-                visibleCheckboxes.forEach(cb => cb.checked = source.checked);
-            }
+            function toggleAll(source) { document.querySelectorAll('.chapter-row:not(.hidden) .chapter-check').forEach(cb => cb.checked = source.checked); }
 
             async function generateSelected() {
                 const selected = Array.from(document.querySelectorAll('.chapter-check:checked'));
-                if (selected.length === 0) return alert("Select chapters first");
-                if (!confirm(`Generate ${selected.length} chapters in background?`)) return;
-
-                const batchBtn = document.getElementById('batchBtn');
-                batchBtn.disabled = true;
-                
-                const voice = document.getElementById('batchVoice').value;
-                const speed = parseFloat(document.getElementById('batchSpeed').value);
+                if (selected.length === 0) return alert("Select chapters");
+                if (!confirm(`Generate ${selected.length} chapters?`)) return;
                 
                 const batchRequests = [];
-
                 for (const check of selected) {
                     const id = check.getAttribute('data-id');
-                    const name = check.getAttribute('data-name');
-                    
-                    // Visual feedback
                     document.getElementById(`status-${id}`).innerHTML = '<span class="status-pill status-queued">Queuing...</span>';
-
-                    // Fetch content for each
                     const txtRes = await fetch('/book/chapter-content/' + id);
                     const txtData = await txtRes.json();
-                    
-                    batchRequests.push({
-                        text: txtData.content,
-                        voice: voice,
-                        speed: speed,
-                        book_title: "mvs-1401-2100",
-                        chapter_name: name,
-                        epub_item_id: id
-                    });
-                    
+                    batchRequests.push({ text: txtData.content, voice: document.getElementById('batchVoice').value, speed: parseFloat(document.getElementById('batchSpeed').value), book_title: "mvs-1401-2100", chapter_name: check.getAttribute('data-name'), epub_item_id: id });
                     check.checked = false;
                 }
-
-                // Send to background route
-                const res = await fetch('/tts/batch', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(batchRequests)
-                });
-
-                if (res.ok) {
-                    console.log("Batch accepted by background worker.");
-                }
-
-                batchBtn.disabled = false;
+                await fetch('/tts/batch', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(batchRequests) });
             }
 
             async function generate(id, name) {
                 const btn = document.getElementById('btn-' + id);
-                const statusTd = document.getElementById('status-' + id);
-                const voice = document.getElementById('batchVoice').value;
-                const speed = parseFloat(document.getElementById('batchSpeed').value);
-
-                btn.disabled = true;
-                btn.innerHTML = '<div class="loader"></div>';
-                
-                try {
-                    const txtRes = await fetch('/book/chapter-content/' + id);
-                    const txtData = await txtRes.json();
-                    const ttsRes = await fetch('/tts/chapter', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ 
-                            text: txtData.content, 
-                            chapter_name: name,
-                            epub_item_id: id,
-                            voice: voice,
-                            speed: speed
-                        })
-                    });
-                    if (ttsRes.ok) {
-                        statusTd.innerHTML = '<span class="status-pill status-ready">Cloud Ready</span>';
-                    }
-                } catch (e) {
-                    statusTd.innerHTML = '<span class="status-pill status-missing">Error</span>';
-                } finally { 
-                    btn.disabled = false; 
-                    btn.innerHTML = '<i class="fas fa-play"></i>';
-                }
+                btn.disabled = true; btn.innerHTML = '<div class="loader"></div>';
+                const txtRes = await fetch('/book/chapter-content/' + id);
+                const txtData = await txtRes.json();
+                await fetch('/tts/chapter', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ text: txtData.content, chapter_name: name, epub_item_id: id, voice: document.getElementById('batchVoice').value, speed: parseFloat(document.getElementById('batchSpeed').value) }) });
+                btn.disabled = false; btn.innerHTML = '<i class="fas fa-play"></i>';
             }
 
-            // Auto-refresh status every 5 seconds to show background progress
             setInterval(async () => {
-                const statusRes = await fetch('/book/status');
+                const [statusRes, queueRes] = await Promise.all([fetch('/book/status'), fetch('/book/queue')]);
                 readyIds = await statusRes.json();
-                
+                const activeQueue = await queueRes.json();
                 allChapters.forEach(c => {
-                    const statusTd = document.getElementById(`status-${c.id}`);
-                    if (readyIds.includes(c.id)) {
-                        statusTd.innerHTML = '<span class="status-pill status-ready">Cloud Ready</span>';
-                    }
+                    const td = document.getElementById(`status-${c.id}`);
+                    if (readyIds.includes(c.id)) td.innerHTML = '<span class="status-pill status-ready">Cloud Ready</span>';
+                    else if (activeQueue.includes(c.id)) td.innerHTML = '<span class="status-pill status-queued"><i class="fas fa-spinner fa-spin"></i> Processing...</span>';
                 });
-                document.getElementById('stats').innerText = `TOTAL: ${allChapters.length} | READY: ${readyIds.length}`;
+                document.getElementById('stats').innerText = `TOTAL: ${allChapters.length} | READY: ${readyIds.length} | ACTIVE: ${activeQueue.length}`;
             }, 5000);
 
             loadAdmin();
@@ -636,4 +573,3 @@ async def admin_dashboard():
     </body>
     </html>
     """)
-
