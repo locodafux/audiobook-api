@@ -6,7 +6,6 @@ argon2-cffi==25.1.0
 argon2-cffi-bindings==25.1.0
 attrs==25.4.0
 babel==2.18.0
-beautifulsoup4==4.14.3
 blis==1.3.3
 catalogue==2.0.10
 certifi==2026.1.4
@@ -21,18 +20,14 @@ curated-transformers==0.1.1
 cymem==2.0.13
 dlinfo==2.0.0
 docopt==0.6.2
-EbookLib==0.20
 ecdsa==0.19.1
 en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 espeakng-loader==0.2.4
 fastapi==0.128.4
-ffmpeg-python==0.2.0
 filelock==3.24.0
 fsspec==2026.2.0
-future==1.0.0
 h11==0.16.0
 hf-xet==1.2.0
-html2text==2025.4.15
 httpcore==1.0.9
 httptools==0.7.1
 httpx==0.28.1
@@ -46,7 +41,6 @@ jsonschema-specifications==2025.9.1
 kokoro==0.9.4
 language-tags==1.2.0
 loguru==0.7.3
-lxml==6.0.2
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 mdurl==0.1.2
@@ -59,18 +53,15 @@ numpy==2.4.2
 packaging==26.0
 phonemizer-fork==3.3.2
 preshed==3.0.12
-psutil==7.2.2
 pyasn1==0.6.2
 pycparser==3.0
 pydantic==2.12.5
 pydantic_core==2.41.5
-pydub==0.25.1
 Pygments==2.19.2
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 python-jose==3.5.0
-python-multipart==0.0.22
 PyYAML==6.0.3
 rdflib==7.6.0
 referencing==0.37.0
@@ -87,7 +78,6 @@ shellingham==1.5.4
 six==1.17.0
 smart_open==7.5.0
 soundfile==0.13.1
-soupsieve==2.8.3
 spacy==3.8.11
 spacy-curated-transformers==0.3.1
 spacy-legacy==3.0.12
