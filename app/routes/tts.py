@@ -23,7 +23,7 @@ router = APIRouter()
 CURRENT_FILE = Path(__file__).resolve()
 APP_ROOT = CURRENT_FILE.parent.parent
 DB_PATH = os.path.join(APP_ROOT.parent, "test.db")
-BOOK_PATH = os.path.join(APP_ROOT, "storage", "books", "Shadow Slave - Volume 01 - Guiltythree.epub")
+BOOK_PATH = os.path.join(APP_ROOT, "storage", "books", "mvs-1401-2100.epub")
 
 # --- GLOBAL TRACKER & QUEUE ---
 ACTIVE_QUEUE = set()
