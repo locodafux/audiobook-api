@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine
 from app.models import Book, User
 from app.services.kokoro_service import init_kokoro
-from app.routes import books, users, tts, epub_tts, mobile_router
+from app.routes import books, users, tts, epub_tts, mobile_router, sample_router
 
 # Create database tables
 Book.metadata.create_all(bind=engine)
@@ -33,7 +33,8 @@ app.include_router(books.router)
 app.include_router(users.router)
 app.include_router(tts.router, prefix="", tags=["TTS"])
 app.include_router(epub_tts.router, prefix="", tags=["EPUB_TTS"])
-app.include_router(mobile_router.router, tags=["Mobile"])
+# app.include_router(mobile_router.router, tags=["Mobile"])
+app.include_router(sample_router.router, tags=["Sample"])
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 80))
