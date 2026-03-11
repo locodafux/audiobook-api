@@ -30,6 +30,7 @@ class ChapterRequest(BaseModel):
     book_title: str = "mvs-1401-2100"
     chapter_name: str = "chapter"
     epub_item_id: str = ""
+    book_id: str = ""
 
 def slugify(value):
     return re.sub(r'[^\w\s-]', '', value).strip().lower().replace(' ', '_')
@@ -54,13 +55,14 @@ def process_single_chapter(request: ChapterRequest):
     """Actual TTS logic executed by the worker."""
     book_slug = slugify(request.book_title)
     chapter_slug = slugify(request.chapter_name)
+    book_id = slugify(request.book_id)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     # Check if exists
-    cursor.execute("SELECT telegram_id FROM chapters WHERE book_slug=? AND epub_item_id=?", 
-                   (book_slug, request.epub_item_id))
+    cursor.execute("SELECT telegram_id FROM chapters WHERE book_slug=? AND epub_item_id=? AND book_id=?", 
+                   (book_slug, request.epub_item_id, book_id))
     if cursor.fetchone():
         conn.close()
         return
@@ -71,9 +73,9 @@ def process_single_chapter(request: ChapterRequest):
         )
         if tg_file_id:
             cursor.execute("""
-                INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, epub_item_id, telegram_id, metadata_json) 
-                VALUES (?, ?, ?, ?, ?)
-            """, (book_slug, chapter_slug, request.epub_item_id, tg_file_id, json.dumps(metadata)))
+                INSERT OR REPLACE INTO chapters (book_slug, chapter_slug, epub_item_id, telegram_id, metadata_json, book_id) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (book_slug, chapter_slug, request.epub_item_id, tg_file_id, json.dumps(metadata), book_id))
             conn.commit()
     finally:
         conn.close()

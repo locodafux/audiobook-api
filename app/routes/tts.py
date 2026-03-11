@@ -61,20 +61,20 @@ class ChapterRequest(BaseModel):
     epub_item_id: str = ""
 
 # --- SEQUENTIAL WORKER ---
-async def background_worker():
-    """Loops forever, picking up one task at a time from the queue."""
-    while True:
-        request = await TASK_QUEUE.get()
-        ACTIVE_QUEUE.add(request.epub_item_id)
+# async def background_worker():
+#     """Loops forever, picking up one task at a time from the queue."""
+#     while True:
+#         request = await TASK_QUEUE.get()
+#         ACTIVE_QUEUE.add(request.epub_item_id)
         
-        try:
-            # Run the heavy TTS in a thread to avoid blocking the event loop
-            await asyncio.to_thread(process_single_chapter, request)
-        except Exception as e:
-            print(f"Worker Error: {e}")
-        finally:
-            ACTIVE_QUEUE.discard(request.epub_item_id)
-            TASK_QUEUE.task_done()
+#         try:
+#             # Run the heavy TTS in a thread to avoid blocking the event loop
+#             await asyncio.to_thread(process_single_chapter, request)
+#         except Exception as e:
+#             print(f"Worker Error: {e}")
+#         finally:
+#             ACTIVE_QUEUE.discard(request.epub_item_id)
+#             TASK_QUEUE.task_done()
 
 def process_single_chapter(request: ChapterRequest):
     """Actual TTS logic executed by the worker."""
@@ -105,9 +105,9 @@ def process_single_chapter(request: ChapterRequest):
         conn.close()
 
 # Start the worker task when the module loads
-@router.on_event("startup")
-async def startup_event():
-    asyncio.create_task(background_worker())
+# @router.on_event("startup")
+# async def startup_event():
+#     asyncio.create_task(background_worker())
 
 # --- API ENDPOINTS ---
 
